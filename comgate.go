@@ -36,32 +36,34 @@ const (
 	// is zero.
 	DefaultTimeout = 30 * time.Second
 
-	apiVersionPath    = "/v2.0"
-	maxResponseBytes  = 64 << 10
-	dialTimeout       = 3 * time.Second
-	minAmountMinor    = 100
-	maxAmountMinor    = 100_000_000
-	codeInvalidInput  = 1400
-	codeInvalidMethod = 1401
-	codeInvalidPrice  = 1402
-	contentTypeJSON   = "application/json"
-	schemeHTTP        = "http"
-	schemeHTTPS       = "https"
-	nullLiteral       = "null"
-	booleanTrue       = "true"
-	booleanFalse      = "false"
-	currencyCZK       = "CZK"
-	merchantIDLimit   = 100
-	secretLimit       = 4096
-	transactionIDMin  = 3
-	transactionIDMax  = 100
-	referenceLimit    = 100
-	redirectURLLimit  = 2048
-	labelRuneLimit    = 16
-	emailLimit        = 254
-	phoneLimit        = 16
-	fullNameRuneLimit = 200
-	expirationTime    = "30m"
+	apiVersionPath          = "/v2.0"
+	maxResponseBytes        = 64 << 10
+	maxNotificationBytes    = 64 << 10
+	dialTimeout             = 3 * time.Second
+	minAmountMinor          = 100
+	maxAmountMinor          = 100_000_000
+	recurringMinAmountMinor = 1000
+	codeInvalidInput        = 1400
+	codeInvalidMethod       = 1401
+	codeInvalidPrice        = 1402
+	contentTypeJSON         = "application/json"
+	schemeHTTP              = "http"
+	schemeHTTPS             = "https"
+	nullLiteral             = "null"
+	booleanTrue             = "true"
+	booleanFalse            = "false"
+	currencyCZK             = "CZK"
+	merchantIDLimit         = 100
+	secretLimit             = 4096
+	transactionIDMin        = 3
+	transactionIDMax        = 100
+	referenceLimit          = 100
+	redirectURLLimit        = 2048
+	labelRuneLimit          = 16
+	emailLimit              = 254
+	phoneLimit              = 16
+	fullNameRuneLimit       = 200
+	expirationTime          = "30m"
 )
 
 const (
@@ -308,6 +310,7 @@ func (client *Client) Create(ctx context.Context, input CreateInput) (Session, e
 		Price: input.Amount, Currency: input.Currency, Label: input.Label,
 		Reference: input.Reference, Method: input.Method, Email: input.Email,
 		Phone: input.Phone, FullName: input.FullName, Test: input.Test,
+		Preauth: input.Preauth, InitRecurring: input.InitRecurring,
 		EnableApplePayGooglePay: true, ExpirationTime: expirationTime,
 	})
 	if err != nil {
@@ -405,9 +408,103 @@ func (client *Client) Cancel(ctx context.Context, transactionID string) error {
 	if client == nil || client.client == nil || !validTransactionID(transactionID) {
 		return ErrProtocol
 	}
+	return client.cancelPending(ctx, "/payment/transId/"+transactionID+".json")
+}
+
+// Capture confirms a pre-authorized card payment. The amount is in minor
+// units. An amount of zero captures the full pre-authorized amount and omits
+// the amount from the request. A value from 1 to 100000000 captures that
+// partial amount. A provider status 204 or a JSON result code 0 reports
+// success. A definite rejection returns ErrRejected. Any other failure
+// returns ErrAmbiguous.
+func (client *Client) Capture(ctx context.Context, input CaptureInput) error {
+	if client == nil || client.client == nil || input.Validate() != nil {
+		return ErrProtocol
+	}
 	response, err := client.request(
-		ctx, http.MethodDelete, "/payment/transId/"+transactionID+".json", nil,
+		ctx,
+		http.MethodPut,
+		"/preauth/transId/"+input.ExternalReference+".json",
+		captureRequest{Amount: input.Amount},
 	)
+	if err != nil {
+		return ErrAmbiguous
+	}
+	defer response.Body.Close()
+	return classifyMutation(response)
+}
+
+// CancelPreauth releases the money blocked by a pre-authorized card payment.
+// Use it when the order cannot be fulfilled and the pre-authorization must
+// not be captured. A provider status 204 or a JSON result code 0 reports
+// success. A definite rejection returns ErrRejected. Any other outcome
+// returns ErrAmbiguous.
+func (client *Client) CancelPreauth(ctx context.Context, transactionID string) error {
+	if client == nil || client.client == nil || !validTransactionID(transactionID) {
+		return ErrProtocol
+	}
+	return client.cancelPending(ctx, "/preauth/transId/"+transactionID+".json")
+}
+
+// Recurring charges a stored payment method. InitRecurringID must be the
+// transaction ID of an initial recurring payment created with
+// CreateInput.InitRecurring. The charge runs in the background. The returned
+// RecurringCharge carries the transaction ID of the new payment. A definite
+// rejection returns ErrRejected. Any other failure returns ErrAmbiguous.
+func (client *Client) Recurring(
+	ctx context.Context,
+	input RecurringInput,
+) (RecurringCharge, error) {
+	if client == nil || client.client == nil || input.Validate() != nil {
+		return RecurringCharge{}, ErrProtocol
+	}
+	response, err := client.request(ctx, http.MethodPost, "/recurring.json", recurringRequest{
+		Test: input.Test, Price: input.Amount, Currency: input.Currency,
+		Label: input.Label, Reference: input.Reference,
+		InitRecurringID: input.InitRecurringID,
+	})
+	if err != nil {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	defer response.Body.Close()
+	statusCode := response.StatusCode
+	if statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode >= http.StatusInternalServerError {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	if statusCode != http.StatusOK {
+		if statusCode >= http.StatusBadRequest &&
+			statusCode < http.StatusInternalServerError {
+			return RecurringCharge{}, ErrRejected
+		}
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	if !jsonResponse(response) {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	body, err := readResponse(response)
+	if err != nil {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	var result createResponse
+	if json.Unmarshal(body, &result) != nil || !result.Code.set {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	if result.Code.value != 0 {
+		if definitiveCode(result.Code.value) {
+			return RecurringCharge{}, ErrRejected
+		}
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	if !validTransactionID(result.TransID) {
+		return RecurringCharge{}, ErrAmbiguous
+	}
+	return RecurringCharge{ExternalReference: result.TransID}, nil
+}
+
+func (client *Client) cancelPending(ctx context.Context, path string) error {
+	response, err := client.request(ctx, http.MethodDelete, path, nil)
 	if err != nil {
 		return ErrAmbiguous
 	}
@@ -464,33 +561,7 @@ func (client *Client) Refund(ctx context.Context, input RefundInput) error {
 		return ErrAmbiguous
 	}
 	defer response.Body.Close()
-	statusCode := response.StatusCode
-	if statusCode == http.StatusNoContent {
-		return nil
-	}
-	if statusCode >= http.StatusOK &&
-		statusCode < http.StatusMultipleChoices &&
-		statusCode != http.StatusOK {
-		return ErrAmbiguous
-	}
-	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
-		return classifyRefundFailure(statusCode)
-	}
-	body, err := readResponse(response)
-	if err != nil {
-		return ErrAmbiguous
-	}
-	code, hasCode := resultCode(response, body)
-	if !hasCode {
-		return ErrAmbiguous
-	}
-	if code != 0 {
-		if definitiveCode(code) {
-			return ErrRejected
-		}
-		return ErrAmbiguous
-	}
-	return nil
+	return classifyMutation(response)
 }
 
 // Close releases the idle connections created by the client. It does nothing

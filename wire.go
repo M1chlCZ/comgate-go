@@ -19,6 +19,8 @@ type createRequest struct {
 	Phone                   string `json:"phone"`
 	FullName                string `json:"fullName"`
 	Test                    bool   `json:"test"`
+	Preauth                 bool   `json:"preauth,omitempty"`
+	InitRecurring           bool   `json:"initRecurring,omitempty"`
 	EnableApplePayGooglePay bool   `json:"enableApplePayGooglePay"`
 	ExpirationTime          string `json:"expirationTime"`
 }
@@ -28,6 +30,19 @@ type refundRequest struct {
 	Amount    int64  `json:"amount"`
 	Test      bool   `json:"test"`
 	Reference string `json:"refId"`
+}
+
+type captureRequest struct {
+	Amount int64 `json:"amount,omitempty"`
+}
+
+type recurringRequest struct {
+	Test            bool   `json:"test"`
+	Price           int64  `json:"price"`
+	Currency        string `json:"curr"`
+	Label           string `json:"label"`
+	Reference       string `json:"refId"`
+	InitRecurringID string `json:"initRecurringId"`
 }
 
 type createResponse struct {
@@ -74,24 +89,34 @@ type decimalString struct {
 
 func (value *decimalString) UnmarshalJSON(raw []byte) error {
 	var encoded string
-	if json.Unmarshal(raw, &encoded) != nil ||
-		encoded == "" ||
-		len(encoded) > 9 ||
-		len(encoded) > 1 && encoded[0] == '0' {
+	if json.Unmarshal(raw, &encoded) != nil {
 		return errors.New("comgate: invalid decimal string")
 	}
-	for _, digit := range encoded {
-		if digit < '0' || digit > '9' {
-			return errors.New("comgate: invalid decimal string")
-		}
-	}
-	parsed, err := strconv.ParseInt(encoded, 10, 64)
-	if err != nil || parsed < minAmountMinor || parsed > maxAmountMinor {
-		return errors.New("comgate: invalid decimal string")
+	parsed, err := parseDecimalString(encoded)
+	if err != nil {
+		return err
 	}
 	value.value = parsed
 	value.set = true
 	return nil
+}
+
+func parseDecimalString(encoded string) (int64, error) {
+	if encoded == "" ||
+		len(encoded) > 9 ||
+		len(encoded) > 1 && encoded[0] == '0' {
+		return 0, errors.New("comgate: invalid decimal string")
+	}
+	for _, digit := range encoded {
+		if digit < '0' || digit > '9' {
+			return 0, errors.New("comgate: invalid decimal string")
+		}
+	}
+	parsed, err := strconv.ParseInt(encoded, 10, 64)
+	if err != nil || parsed < minAmountMinor || parsed > maxAmountMinor {
+		return 0, errors.New("comgate: invalid decimal string")
+	}
+	return parsed, nil
 }
 
 type booleanString struct {
@@ -104,16 +129,24 @@ func (value *booleanString) UnmarshalJSON(raw []byte) error {
 	if json.Unmarshal(raw, &encoded) != nil {
 		return errors.New("comgate: invalid boolean string")
 	}
-	switch encoded {
-	case booleanTrue:
-		value.value = true
-	case booleanFalse:
-		value.value = false
-	default:
-		return errors.New("comgate: invalid boolean string")
+	parsed, err := parseBooleanString(encoded)
+	if err != nil {
+		return err
 	}
+	value.value = parsed
 	value.set = true
 	return nil
+}
+
+func parseBooleanString(encoded string) (bool, error) {
+	switch encoded {
+	case booleanTrue:
+		return true, nil
+	case booleanFalse:
+		return false, nil
+	default:
+		return false, errors.New("comgate: invalid boolean string")
+	}
 }
 
 func jsonResponse(response *http.Response) bool {
@@ -169,4 +202,37 @@ func classifyRefundFailure(statusCode int) error {
 		return ErrRejected
 	}
 	return ErrAmbiguous
+}
+
+func classifyMutation(response *http.Response) error {
+	if response == nil {
+		return ErrAmbiguous
+	}
+	statusCode := response.StatusCode
+	if statusCode == http.StatusNoContent {
+		return nil
+	}
+	if statusCode >= http.StatusOK &&
+		statusCode < http.StatusMultipleChoices &&
+		statusCode != http.StatusOK {
+		return ErrAmbiguous
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return classifyRefundFailure(statusCode)
+	}
+	body, err := readResponse(response)
+	if err != nil {
+		return ErrAmbiguous
+	}
+	code, hasCode := resultCode(response, body)
+	if !hasCode {
+		return ErrAmbiguous
+	}
+	if code != 0 {
+		if definitiveCode(code) {
+			return ErrRejected
+		}
+		return ErrAmbiguous
+	}
+	return nil
 }

@@ -38,6 +38,15 @@ type CreateInput struct {
 	FullName string
 	// Test reports a test payment when true.
 	Test bool
+	// Preauth requests a card pre-authorization. Only card payment methods
+	// support pre-authorization. The provider reports a successful
+	// pre-authorization as AUTHORIZED, which Status maps to StatusPending.
+	// Confirm the payment with Capture or release it with CancelPreauth.
+	Preauth bool
+	// InitRecurring marks the payment as the initial transaction of a
+	// recurring payment. The first payment runs through the hosted gateway.
+	// Later charges use Recurring with the returned transaction ID.
+	InitRecurring bool
 }
 
 // Validate checks the input fields. It returns ErrProtocol for invalid input.
@@ -91,6 +100,72 @@ func (input RefundInput) Validate() error {
 		return ErrProtocol
 	}
 	return nil
+}
+
+// CaptureInput describes the confirmation of a pre-authorized card payment.
+type CaptureInput struct {
+	// ExternalReference is the provider transaction ID of the pre-authorized
+	// payment. Use the Session.ExternalReference value from Create.
+	ExternalReference string
+	// Amount is the amount to debit in minor units. Zero requests the full
+	// pre-authorized amount and omits the amount from the request. A value
+	// from 1 to 100000000 requests a partial capture.
+	Amount int64
+}
+
+// Validate checks the input fields. It returns ErrProtocol for invalid input.
+func (input CaptureInput) Validate() error {
+	if !validTransactionID(input.ExternalReference) ||
+		input.Amount < 0 ||
+		input.Amount > maxAmountMinor {
+		return ErrProtocol
+	}
+	return nil
+}
+
+// RecurringInput describes a charge of a stored recurring payment.
+type RecurringInput struct {
+	// InitRecurringID is the provider transaction ID of the initial
+	// recurring payment. Use the Session.ExternalReference value from a
+	// Create call with CreateInput.InitRecurring.
+	InitRecurringID string
+	// Reference is the merchant order reference. It must not be empty and is
+	// limited to 100 bytes.
+	Reference string
+	// Amount is the price in minor units. The minimum is 1000 (10 CZK) and
+	// the maximum is 100000000.
+	Amount int64
+	// Currency is the ISO 4217 code. Only "CZK" is accepted.
+	Currency string
+	// Label is the short payment label. It is limited to 16 characters.
+	Label string
+	// Test reports a test charge when true.
+	Test bool
+}
+
+// Validate checks the input fields. It returns ErrProtocol for invalid input.
+func (input RecurringInput) Validate() error {
+	for _, value := range []string{input.Reference, input.Currency, input.Label} {
+		if strings.TrimSpace(value) != value || value == "" || !utf8.ValidString(value) {
+			return ErrProtocol
+		}
+	}
+	if !validTransactionID(input.InitRecurringID) ||
+		input.Amount < recurringMinAmountMinor ||
+		input.Amount > maxAmountMinor ||
+		input.Currency != currencyCZK ||
+		len(input.Reference) > referenceLimit ||
+		utf8.RuneCountInString(input.Label) > labelRuneLimit {
+		return ErrProtocol
+	}
+	return nil
+}
+
+// RecurringCharge is the result of a recurring charge.
+type RecurringCharge struct {
+	// ExternalReference is the provider transaction ID of the new charge.
+	// Read its state with Status.
+	ExternalReference string
 }
 
 // Session is a created payment session.

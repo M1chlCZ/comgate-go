@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1683,6 +1684,594 @@ func TestClassifyRefundFailure(t *testing.T) {
 	}
 }
 
+func TestPartialRefundSendsExactFields(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/v2.0/refund.json" || request.Method != http.MethodPost {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode refund request: %v", err)
+		}
+		want := map[string]any{
+			"transId": "ABCD-EFGH-IJKL",
+			"amount":  float64(1000),
+			"test":    true,
+			"refId":   "018f0000-0000-4000-8000-0000000000c1",
+		}
+		if !reflect.DeepEqual(body, want) {
+			t.Errorf("partial refund request = %#v, want %#v", body, want)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"code":0,"message":"accepted"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	input := validRefundInput()
+	input.Amount = 1000
+	if err := client.Refund(context.Background(), input); err != nil {
+		t.Fatalf("partial Refund: %v", err)
+	}
+}
+
+func TestPartialRefundRejectionIsDefinite(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusBadRequest)
+		_, _ = response.Write([]byte(
+			`{"code":1402,"message":"refund amount higher than allowed"}`,
+		))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	input := validRefundInput()
+	input.Amount = maxAmountMinor
+	if err := client.Refund(context.Background(), input); !errors.Is(err, ErrRejected) {
+		t.Fatalf("partial refund rejection error = %v", err)
+	}
+}
+
+func TestCreateSendsPreauthAndInitRecurringFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		field string
+		set   func(*CreateInput)
+	}{
+		{
+			name: "preauth", field: "preauth",
+			set: func(input *CreateInput) { input.Preauth = true },
+		},
+		{
+			name: "initRecurring", field: "initRecurring",
+			set: func(input *CreateInput) { input.InitRecurring = true },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				request *http.Request,
+			) {
+				var body map[string]any
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Errorf("decode create request: %v", err)
+				}
+				if body[test.field] != true {
+					t.Errorf("create %s = %#v", test.field, body[test.field])
+				}
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusCreated)
+				_, _ = response.Write([]byte(`{
+					"code":0,
+					"transId":"ABCD-EFGH-IJKL",
+					"redirect":"https://payments.comgate.cz/client/opaqueredirect"
+				}`))
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server, time.Second)
+			input := validCreateInput()
+			test.set(&input)
+			if _, err := client.Create(context.Background(), input); err != nil {
+				t.Fatalf("Create %s: %v", test.name, err)
+			}
+		})
+	}
+
+	t.Run("defaults omit the flags", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(
+			response http.ResponseWriter,
+			request *http.Request,
+		) {
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode create request: %v", err)
+			}
+			if _, ok := body["preauth"]; ok {
+				t.Errorf("preauth present in default create: %#v", body["preauth"])
+			}
+			if _, ok := body["initRecurring"]; ok {
+				t.Errorf("initRecurring present in default create: %#v", body["initRecurring"])
+			}
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusCreated)
+			_, _ = response.Write([]byte(`{
+				"code":0,
+				"transId":"ABCD-EFGH-IJKL",
+				"redirect":"https://payments.comgate.cz/client/opaqueredirect"
+			}`))
+		}))
+		t.Cleanup(server.Close)
+		client := newTestClient(t, server, time.Second)
+		if _, err := client.Create(context.Background(), validCreateInput()); err != nil {
+			t.Fatalf("default Create: %v", err)
+		}
+	})
+}
+
+func TestCaptureSendsPartialAmountAndFullCaptureOmitsAmount(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		amount int64
+		want   map[string]any
+	}{
+		{
+			name: "partial capture", amount: 1000,
+			want: map[string]any{"amount": float64(1000)},
+		},
+		{name: "full capture", amount: 0, want: map[string]any{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				request *http.Request,
+			) {
+				if request.URL.Path != "/v2.0/preauth/transId/ABCD-EFGH-IJKL.json" ||
+					request.Method != http.MethodPut {
+					t.Errorf("request = %s %s", request.Method, request.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Errorf("decode capture request: %v", err)
+				}
+				if !reflect.DeepEqual(body, test.want) {
+					t.Errorf("capture request = %#v, want %#v", body, test.want)
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{"code":0,"message":"OK"}`))
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server, time.Second)
+			err := client.Capture(context.Background(), CaptureInput{
+				ExternalReference: "ABCD-EFGH-IJKL",
+				Amount:            test.amount,
+			})
+			if err != nil {
+				t.Fatalf("Capture: %v", err)
+			}
+		})
+	}
+}
+
+func TestCaptureClassifiesFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		statusCode  int
+		contentType string
+		body        string
+		want        error
+	}{
+		{
+			name: "no content", statusCode: http.StatusNoContent,
+		},
+		{
+			name: "rejection is definite", statusCode: http.StatusBadRequest,
+			contentType: "application/json",
+			body:        `{"code":1400,"message":"invalid"}`,
+			want:        ErrRejected,
+		},
+		{
+			name: "rate limit is ambiguous", statusCode: http.StatusTooManyRequests,
+			contentType: "application/json",
+			body:        `{"code":1500,"message":"busy"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "server error is ambiguous", statusCode: http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"code":1400,"message":"contradictory"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "accepted without a result is ambiguous", statusCode: http.StatusAccepted,
+			want: ErrAmbiguous,
+		},
+		{
+			name: "non-JSON is ambiguous", statusCode: http.StatusOK,
+			contentType: "text/plain",
+			body:        `{"code":0}`,
+			want:        ErrAmbiguous,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				if test.contentType != "" {
+					response.Header().Set("Content-Type", test.contentType)
+				}
+				response.WriteHeader(test.statusCode)
+				_, _ = response.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, time.Second)
+			err := client.Capture(
+				context.Background(),
+				CaptureInput{ExternalReference: "ABCD-EFGH-IJKL", Amount: 1000},
+			)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Capture error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCancelPreauthUsesPreauthEndpointAndClassifiesFailures(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no content", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(
+			response http.ResponseWriter,
+			request *http.Request,
+		) {
+			if request.URL.Path != "/v2.0/preauth/transId/ABCD-EFGH-IJKL.json" ||
+				request.Method != http.MethodDelete {
+				t.Errorf("request = %s %s", request.Method, request.URL.Path)
+			}
+			response.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(server.Close)
+		client := newTestClient(t, server, time.Second)
+		if err := client.CancelPreauth(
+			context.Background(), "ABCD-EFGH-IJKL",
+		); err != nil {
+			t.Fatalf("CancelPreauth: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		want       error
+	}{
+		{name: "rejection is definite", statusCode: http.StatusBadRequest, want: ErrRejected},
+		{name: "rate limit is ambiguous", statusCode: http.StatusTooManyRequests, want: ErrAmbiguous},
+		{name: "server error is ambiguous", statusCode: http.StatusInternalServerError, want: ErrAmbiguous},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(test.statusCode)
+				_, _ = response.Write([]byte(`{"code":1400,"message":"failure"}`))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, time.Second)
+			err := client.CancelPreauth(context.Background(), "ABCD-EFGH-IJKL")
+			if !errors.Is(err, test.want) {
+				t.Fatalf("CancelPreauth error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestRecurringSendsExactFieldsAndReturnsTransactionID(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/v2.0/recurring.json" || request.Method != http.MethodPost {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode recurring request: %v", err)
+		}
+		want := map[string]any{
+			"test":            true,
+			"price":           float64(1200),
+			"curr":            "CZK",
+			"label":           "Subscription 1",
+			"refId":           "018f0000-0000-4000-8000-0000000000c1",
+			"initRecurringId": "ABCD-EFGH-IJKL",
+		}
+		if !reflect.DeepEqual(body, want) {
+			t.Errorf("recurring request = %#v, want %#v", body, want)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{
+			"code":0,
+			"message":"OK",
+			"transId":"WXYZ-1234-5678"
+		}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	charge, err := client.Recurring(context.Background(), validRecurringInput())
+	if err != nil {
+		t.Fatalf("Recurring: %v", err)
+	}
+	if charge.ExternalReference != "WXYZ-1234-5678" {
+		t.Fatalf("charge = %#v", charge)
+	}
+}
+
+func TestRecurringClassifiesFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		statusCode  int
+		contentType string
+		body        string
+		want        error
+	}{
+		{
+			name: "rejection is definite", statusCode: http.StatusBadRequest,
+			contentType: "application/json",
+			body:        `{"code":1400,"message":"invalid"}`,
+			want:        ErrRejected,
+		},
+		{
+			name: "rate limit is ambiguous", statusCode: http.StatusTooManyRequests,
+			contentType: "application/json",
+			body:        `{"code":1500,"message":"busy"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "server error is ambiguous", statusCode: http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"code":1500,"message":"failure"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "accepted without a result is ambiguous", statusCode: http.StatusAccepted,
+			want: ErrAmbiguous,
+		},
+		{
+			name: "no content is ambiguous", statusCode: http.StatusNoContent,
+			want: ErrAmbiguous,
+		},
+		{
+			name: "missing transaction ID is ambiguous", statusCode: http.StatusOK,
+			contentType: "application/json",
+			body:        `{"code":0,"message":"OK"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "definitive result code is rejected", statusCode: http.StatusOK,
+			contentType: "application/json",
+			body:        `{"code":1400,"message":"invalid"}`,
+			want:        ErrRejected,
+		},
+		{
+			name: "unknown result code is ambiguous", statusCode: http.StatusOK,
+			contentType: "application/json",
+			body:        `{"code":1500,"message":"failure"}`,
+			want:        ErrAmbiguous,
+		},
+		{
+			name: "non-JSON is ambiguous", statusCode: http.StatusOK,
+			contentType: "text/plain",
+			body:        `{"code":0,"transId":"WXYZ-1234-5678"}`,
+			want:        ErrAmbiguous,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				if test.contentType != "" {
+					response.Header().Set("Content-Type", test.contentType)
+				}
+				response.WriteHeader(test.statusCode)
+				_, _ = response.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, time.Second)
+			_, err := client.Recurring(context.Background(), validRecurringInput())
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Recurring error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestPreauthAndRecurringRejectInvalidInputBeforeNetwork(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		hits.Add(1)
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	captures := []CaptureInput{
+		{},
+		{ExternalReference: "AB"},
+		{ExternalReference: "../preauth"},
+		{ExternalReference: "ABCD-EFGH-IJKL", Amount: -1},
+		{ExternalReference: "ABCD-EFGH-IJKL", Amount: maxAmountMinor + 1},
+	}
+	for _, input := range captures {
+		if err := client.Capture(
+			context.Background(), input,
+		); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("Capture invalid input %#v error = %v", input, err)
+		}
+	}
+	for _, transactionID := range []string{
+		"", "../preauth", strings.Repeat("A", transactionIDMax+1),
+	} {
+		if err := client.CancelPreauth(
+			context.Background(), transactionID,
+		); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("CancelPreauth(%q) error = %v", transactionID, err)
+		}
+	}
+	recurring := []RecurringInput{
+		{},
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.InitRecurringID = "AB"
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Amount = recurringMinAmountMinor - 1
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Amount = maxAmountMinor + 1
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Currency = "EUR"
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Reference = " ref"
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Reference = strings.Repeat("r", referenceLimit+1)
+			return input
+		}(),
+		func() RecurringInput {
+			input := validRecurringInput()
+			input.Label = strings.Repeat("l", labelRuneLimit+1)
+			return input
+		}(),
+	}
+	for _, input := range recurring {
+		if _, err := client.Recurring(
+			context.Background(), input,
+		); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("Recurring invalid input %#v error = %v", input, err)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("invalid inputs reached provider %d times", hits.Load())
+	}
+}
+
+func TestNewMethodsNilSafety(t *testing.T) {
+	t.Parallel()
+
+	var client *Client
+	if err := client.Capture(
+		context.Background(),
+		CaptureInput{ExternalReference: "ABCD-EFGH-IJKL", Amount: 1000},
+	); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("nil Capture error = %v", err)
+	}
+	if err := client.CancelPreauth(
+		context.Background(), "ABCD-EFGH-IJKL",
+	); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("nil CancelPreauth error = %v", err)
+	}
+	if _, err := client.Recurring(
+		context.Background(), validRecurringInput(),
+	); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("nil Recurring error = %v", err)
+	}
+}
+
+func TestNewMethodsTransportErrorsAreAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	client := newRoundTripClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network down")
+	}))
+	if err := client.Capture(
+		context.Background(),
+		CaptureInput{ExternalReference: "ABCD-EFGH-IJKL", Amount: 1000},
+	); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("Capture transport error = %v", err)
+	}
+	if err := client.CancelPreauth(
+		context.Background(), "ABCD-EFGH-IJKL",
+	); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("CancelPreauth transport error = %v", err)
+	}
+	if _, err := client.Recurring(
+		context.Background(), validRecurringInput(),
+	); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("Recurring transport error = %v", err)
+	}
+}
+
+func TestCaptureInputValidate(t *testing.T) {
+	t.Parallel()
+
+	input := CaptureInput{ExternalReference: "ABCD-EFGH-IJKL"}
+	if err := input.Validate(); err != nil {
+		t.Fatalf("full capture rejected: %v", err)
+	}
+	input.Amount = maxAmountMinor
+	if err := input.Validate(); err != nil {
+		t.Fatalf("maximum amount rejected: %v", err)
+	}
+}
+
+func TestRecurringInputValidate(t *testing.T) {
+	t.Parallel()
+
+	if err := validRecurringInput().Validate(); err != nil {
+		t.Fatalf("valid input rejected: %v", err)
+	}
+	input := validRecurringInput()
+	input.Amount = recurringMinAmountMinor
+	if err := input.Validate(); err != nil {
+		t.Fatalf("minimum amount rejected: %v", err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -1745,5 +2334,16 @@ func validRefundInput() RefundInput {
 		Reference:         "018f0000-0000-4000-8000-0000000000c1",
 		Amount:            3490,
 		Test:              true,
+	}
+}
+
+func validRecurringInput() RecurringInput {
+	return RecurringInput{
+		InitRecurringID: "ABCD-EFGH-IJKL",
+		Reference:       "018f0000-0000-4000-8000-0000000000c1",
+		Amount:          1200,
+		Currency:        "CZK",
+		Label:           "Subscription 1",
+		Test:            true,
 	}
 }
