@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Payment method listing through `Method` and `Methods`. `Methods` reads
+  `GET /v2.0/method.json` and returns the enabled merchant payment methods
+  with their provider identifier, group, display names and logo URLs. The
+  `comgatest` simulator reports a deterministic method list.
+
 ## [0.2.0] - 2026-10-21
 
 ### Added

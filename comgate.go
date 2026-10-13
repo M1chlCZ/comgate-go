@@ -2,10 +2,10 @@
 // gateway REST API v2.0.
 //
 // The client creates hosted-gateway payments, reads their status, cancels
-// pending payments and requests refunds. It uses HTTP Basic authentication
-// with Config.MerchantID and Config.Secret. Every request carries the caller
-// context, refuses HTTP redirects and reads JSON responses with a hard 64 KiB
-// limit.
+// pending payments, requests refunds and lists the enabled payment methods.
+// It uses HTTP Basic authentication with Config.MerchantID and Config.Secret.
+// Every request carries the caller context, refuses HTTP redirects and reads
+// JSON responses with a hard 64 KiB limit.
 //
 // The package maps every provider answer to a small set of sentinel errors.
 // The caller decides how to react to a retryable outage, a permanent
@@ -102,8 +102,8 @@ var (
 	// ErrRejected reports a permanent refusal of the request or of the
 	// supplied data. A retry of the same request cannot succeed.
 	ErrRejected = errors.New("comgate: provider rejected the request")
-	// ErrUnavailable reports that a status read cannot reach the provider or
-	// that the provider is temporarily unavailable. A retry can succeed.
+	// ErrUnavailable reports that a read cannot reach the provider or that
+	// the provider is temporarily unavailable. A retry can succeed.
 	ErrUnavailable = errors.New("comgate: provider is unavailable")
 	// ErrNotFound reports an unknown payment. The test simulator returns it.
 	ErrNotFound = errors.New("comgate: payment not found")
@@ -399,6 +399,71 @@ func (client *Client) Status(ctx context.Context, transactionID string) (Status,
 		RawStatus:         result.Status,
 		Test:              result.Test.value,
 	}, nil
+}
+
+// Methods lists the payment methods that the merchant has enabled. The call
+// sends no filters, so the provider applies the account defaults for
+// language, currency and country. Use Method.ID, Method.Group and
+// Method.GroupLabel to render a method selection. A definite rejection
+// returns ErrRejected, an unreachable provider, a timeout or an unknown
+// provider failure returns ErrUnavailable, and a malformed answer returns
+// ErrProtocol.
+func (client *Client) Methods(ctx context.Context) ([]Method, error) {
+	if client == nil || client.client == nil {
+		return nil, ErrProtocol
+	}
+	response, err := client.request(ctx, http.MethodGet, "/method.json", nil)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, classifyMethodsFailure(response.StatusCode)
+	}
+	if !jsonResponse(response) {
+		return nil, ErrProtocol
+	}
+	body, err := readResponse(response)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	var result methodsResponse
+	if json.Unmarshal(body, &result) != nil {
+		return nil, ErrProtocol
+	}
+	if result.Error != nil {
+		if !result.Error.Code.set {
+			return nil, ErrProtocol
+		}
+		if definitiveCode(result.Error.Code.value) {
+			return nil, ErrRejected
+		}
+		return nil, ErrUnavailable
+	}
+	if result.Methods == nil {
+		return nil, ErrProtocol
+	}
+	methods := make([]Method, 0, len(result.Methods))
+	for _, entry := range result.Methods {
+		if entry.ID == "" {
+			return nil, ErrProtocol
+		}
+		methods = append(methods, Method{
+			ID:              entry.ID,
+			Group:           entry.Group,
+			GroupLabel:      entry.GroupLabel,
+			Name:            entry.Name,
+			ShortName:       entry.ShortName,
+			Description:     entry.Description,
+			Logo:            entry.Logo,
+			Logo120Centered: entry.Logo120Centered,
+			Logo240:         entry.Logo240,
+			Logo240Centered: entry.Logo240Centered,
+			Logo150Square:   entry.Logo150Square,
+			Logo100Square:   entry.Logo100Square,
+		})
+	}
+	return methods, nil
 }
 
 // Cancel cancels a pending payment by transaction ID. A provider status 204

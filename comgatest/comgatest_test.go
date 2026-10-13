@@ -3,6 +3,7 @@ package comgatest_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -62,6 +63,36 @@ func TestSimulatorRequiresTestPayments(t *testing.T) {
 		context.Background(), invalid,
 	); !errors.Is(err, comgate.ErrProtocol) {
 		t.Fatalf("invalid Create error = %v", err)
+	}
+}
+
+func TestSimulatorMethods(t *testing.T) {
+	t.Parallel()
+
+	simulator := comgatest.New()
+	first, err := simulator.Methods(context.Background())
+	if err != nil {
+		t.Fatalf("Methods: %v", err)
+	}
+	second, err := simulator.Methods(context.Background())
+	if err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatalf("deterministic Methods = %#v/%#v, %v", first, second, err)
+	}
+	ids := make(map[string]bool)
+	for _, method := range first {
+		if method.ID == "" || method.Group == "" || method.GroupLabel == "" ||
+			method.Name == "" || method.Logo == "" {
+			t.Fatalf("incomplete method = %#v", method)
+		}
+		ids[method.ID] = true
+	}
+	if !ids[comgate.MethodCardAll] || !ids[comgate.MethodBankOnly] {
+		t.Fatalf("method IDs = %#v", ids)
+	}
+	first[0].ID = "MUTATED"
+	third, err := simulator.Methods(context.Background())
+	if err != nil || third[0].ID == "MUTATED" {
+		t.Fatalf("Methods shares state = %#v, %v", third, err)
 	}
 }
 
@@ -141,6 +172,11 @@ func TestSimulatorNilSafety(t *testing.T) {
 		context.Background(), "SIM-UNKNOWN",
 	); !errors.Is(err, comgate.ErrUnavailable) {
 		t.Fatalf("nil Status error = %v", err)
+	}
+	if _, err := simulator.Methods(
+		context.Background(),
+	); !errors.Is(err, comgate.ErrUnavailable) {
+		t.Fatalf("nil Methods error = %v", err)
 	}
 	if err := simulator.Cancel(
 		context.Background(), "SIM-UNKNOWN",

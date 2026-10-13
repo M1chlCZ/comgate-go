@@ -17,7 +17,10 @@ import (
 	comgate "github.com/m1chlcz/comgate-go"
 )
 
-const redirectPrefix = "/comgate-sim/payments/"
+const (
+	redirectPrefix   = "/comgate-sim/payments/"
+	methodLogoPrefix = "/comgate-sim/methods/"
+)
 
 // Simulator is a deterministic in-memory payment provider for tests. Create
 // it with New. Every method is safe for concurrent use.
@@ -83,6 +86,46 @@ func (simulator *Simulator) Status(
 		return comgate.Status{}, comgate.ErrNotFound
 	}
 	return status, nil
+}
+
+// Methods returns a deterministic list of payment methods. The simulator
+// always reports card payments and bank transfers. Every call returns a
+// fresh slice with the same values, so the caller can modify it. A nil
+// simulator returns comgate.ErrUnavailable.
+func (simulator *Simulator) Methods(_ context.Context) ([]comgate.Method, error) {
+	if simulator == nil {
+		return nil, comgate.ErrUnavailable
+	}
+	return []comgate.Method{
+		{
+			ID:              comgate.MethodCardAll,
+			Group:           "CARD",
+			GroupLabel:      "Card payments",
+			Name:            "Card payment",
+			ShortName:       "Card",
+			Description:     "Visa and Mastercard card payments",
+			Logo:            methodLogoPrefix + "card.svg",
+			Logo120Centered: methodLogoPrefix + "card-120c.svg",
+			Logo240:         methodLogoPrefix + "card-240.svg",
+			Logo240Centered: methodLogoPrefix + "card-240c.svg",
+			Logo150Square:   methodLogoPrefix + "card-150s.svg",
+			Logo100Square:   methodLogoPrefix + "card-100s.svg",
+		},
+		{
+			ID:              comgate.MethodBankOnly,
+			Group:           "BANK",
+			GroupLabel:      "Bank transfers",
+			Name:            "Bank transfer",
+			ShortName:       "Bank",
+			Description:     "Instant bank transfer buttons",
+			Logo:            methodLogoPrefix + "bank.svg",
+			Logo120Centered: methodLogoPrefix + "bank-120c.svg",
+			Logo240:         methodLogoPrefix + "bank-240.svg",
+			Logo240Centered: methodLogoPrefix + "bank-240c.svg",
+			Logo150Square:   methodLogoPrefix + "bank-150s.svg",
+			Logo100Square:   methodLogoPrefix + "bank-100s.svg",
+		},
+	}, nil
 }
 
 // Complete marks a stored payment as paid and returns the new status. An

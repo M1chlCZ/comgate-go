@@ -177,6 +177,37 @@ type Session struct {
 	RedirectURL string
 }
 
+// Method is one payment method that the merchant has enabled. The Methods
+// call returns the list. The provider fills the fields from its method table;
+// the logo fields are image URLs.
+type Method struct {
+	// ID is the provider method identifier, for example "CARD_ALL",
+	// "BANK_ONLY" or "CARD_CZ_COMGATE".
+	ID string
+	// Group is the method group identifier, for example "CARD" or "BANK".
+	Group string
+	// GroupLabel is the human-readable group name.
+	GroupLabel string
+	// Name is the human-readable method name in the provider language.
+	Name string
+	// ShortName is the short human-readable method name.
+	ShortName string
+	// Description is the method description in the provider language.
+	Description string
+	// Logo is the URL of the method logo.
+	Logo string
+	// Logo120Centered is the URL of the centered 120px logo.
+	Logo120Centered string
+	// Logo240 is the URL of the 240px logo.
+	Logo240 string
+	// Logo240Centered is the URL of the centered 240px logo.
+	Logo240Centered string
+	// Logo150Square is the URL of the square 150px logo.
+	Logo150Square string
+	// Logo100Square is the URL of the square 100px logo.
+	Logo100Square string
+}
+
 // Status is the current state of a payment.
 type Status struct {
 	// ExternalReference is the provider transaction ID.

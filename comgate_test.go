@@ -1,12 +1,14 @@
 package comgate
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -590,6 +592,330 @@ func TestStatusRejectsHTTPAndMediaTypeErrors(t *testing.T) {
 	})
 }
 
+func TestMethodsSendsDocumentedRequestAndParsesResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/v2.0/method.json" ||
+			request.Method != http.MethodGet {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		if request.URL.RawQuery != "" || request.URL.User != nil {
+			t.Errorf("request URL = %q", request.URL.String())
+		}
+		wantAuth := "Basic " + base64.StdEncoding.EncodeToString(
+			[]byte("merchant:provider-secret"),
+		)
+		if request.Header.Get("Authorization") != wantAuth {
+			t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
+		}
+		if request.Header.Get("Accept") != "application/json" {
+			t.Errorf("Accept = %q", request.Header.Get("Accept"))
+		}
+		response.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = response.Write([]byte(`{
+			"methods": [
+				{
+					"id": "CARD_ALL",
+					"group": "CARD",
+					"groupLabel": "Card payments",
+					"name": "Card payment",
+					"name_short": "Card",
+					"description": "Visa and Mastercard",
+					"logo": "https://payments.comgate.cz/icons/card.svg",
+					"logo_120c": "https://payments.comgate.cz/icons/card-120c.svg",
+					"logo_240": "https://payments.comgate.cz/icons/card-240.svg",
+					"logo_240c": "https://payments.comgate.cz/icons/card-240c.svg",
+					"logo_150s": "https://payments.comgate.cz/icons/card-150s.svg",
+					"logo_100s": "https://payments.comgate.cz/icons/card-100s.svg",
+					"newField": true
+				},
+				{
+					"id": "BANK_CZ_COMGATE",
+					"group": "BANK",
+					"groupLabel": "Bank transfers",
+					"name": "Comgate bank transfer",
+					"name_short": "Bank",
+					"description": "Instant bank transfer",
+					"logo": "https://payments.comgate.cz/icons/bank.svg"
+				}
+			]
+		}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	methods, err := client.Methods(context.Background())
+	if err != nil {
+		t.Fatalf("Methods: %v", err)
+	}
+	want := []Method{
+		{
+			ID: "CARD_ALL", Group: "CARD", GroupLabel: "Card payments",
+			Name: "Card payment", ShortName: "Card",
+			Description:     "Visa and Mastercard",
+			Logo:            "https://payments.comgate.cz/icons/card.svg",
+			Logo120Centered: "https://payments.comgate.cz/icons/card-120c.svg",
+			Logo240:         "https://payments.comgate.cz/icons/card-240.svg",
+			Logo240Centered: "https://payments.comgate.cz/icons/card-240c.svg",
+			Logo150Square:   "https://payments.comgate.cz/icons/card-150s.svg",
+			Logo100Square:   "https://payments.comgate.cz/icons/card-100s.svg",
+		},
+		{
+			ID: "BANK_CZ_COMGATE", Group: "BANK", GroupLabel: "Bank transfers",
+			Name: "Comgate bank transfer", ShortName: "Bank",
+			Description: "Instant bank transfer",
+			Logo:        "https://payments.comgate.cz/icons/bank.svg",
+		},
+	}
+	if !reflect.DeepEqual(methods, want) {
+		t.Fatalf("Methods = %#v, want %#v", methods, want)
+	}
+}
+
+func TestMethodsReturnsEmptyListForNoMethods(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"methods":[]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	methods, err := client.Methods(context.Background())
+	if err != nil {
+		t.Fatalf("Methods: %v", err)
+	}
+	if methods == nil || len(methods) != 0 {
+		t.Fatalf("Methods = %#v", methods)
+	}
+}
+
+func TestMethodsClassifiesRejectionAndUnavailability(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		body       string
+		want       error
+	}{
+		{
+			name: "bad request is definite", statusCode: http.StatusBadRequest,
+			body: `{"error":{"code":1400,"message":"Unauthorized access!"}}`,
+			want: ErrRejected,
+		},
+		{
+			name: "forbidden is definite", statusCode: http.StatusForbidden,
+			body: `{"error":{"code":1400,"message":"Unauthorized access!"}}`,
+			want: ErrRejected,
+		},
+		{
+			name: "request timeout is unavailable", statusCode: http.StatusRequestTimeout,
+			want: ErrUnavailable,
+		},
+		{
+			name: "rate limit is unavailable", statusCode: http.StatusTooManyRequests,
+			want: ErrUnavailable,
+		},
+		{
+			name: "server error is unavailable", statusCode: http.StatusInternalServerError,
+			want: ErrUnavailable,
+		},
+		{
+			name: "no content is unavailable", statusCode: http.StatusNoContent,
+			want: ErrUnavailable,
+		},
+		{
+			name: "redirect is unavailable", statusCode: http.StatusFound,
+			want: ErrUnavailable,
+		},
+		{
+			name: "error envelope is rejected", statusCode: http.StatusOK,
+			body: `{"error":{"code":1400,"message":"Unauthorized access!"}}`,
+			want: ErrRejected,
+		},
+		{
+			name: "unknown error code is unavailable", statusCode: http.StatusOK,
+			body: `{"error":{"code":1500,"message":"Unexpected failure"}}`,
+			want: ErrUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				if test.body != "" {
+					response.Header().Set("Content-Type", "application/json")
+				}
+				response.WriteHeader(test.statusCode)
+				_, _ = response.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, time.Second)
+			if _, err := client.Methods(
+				context.Background(),
+			); !errors.Is(err, test.want) {
+				t.Fatalf("Methods error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMethodsRejectsMalformedResponse(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		contentType string
+		body        string
+		want        error
+	}{
+		{
+			name: "non-JSON content type", contentType: "text/plain",
+			body: `{"methods":[]}`, want: ErrProtocol,
+		},
+		{
+			name: "invalid JSON", contentType: "application/json",
+			body: `{`, want: ErrProtocol,
+		},
+		{
+			name: "missing methods", contentType: "application/json",
+			body: `{"code":0,"message":"OK"}`, want: ErrProtocol,
+		},
+		{
+			name: "null methods", contentType: "application/json",
+			body: `{"methods":null}`, want: ErrProtocol,
+		},
+		{
+			name: "wrong methods type", contentType: "application/json",
+			body: `{"methods":{"id":"CARD_ALL"}}`, want: ErrProtocol,
+		},
+		{
+			name: "empty method ID", contentType: "application/json",
+			body: `{"methods":[{"group":"CARD","name":"Card"}]}`,
+			want: ErrProtocol,
+		},
+		{
+			name: "error without code", contentType: "application/json",
+			body: `{"error":{"message":"Unauthorized access!"}}`,
+			want: ErrProtocol,
+		},
+		{
+			name: "error with null code", contentType: "application/json",
+			body: `{"error":{"code":null,"message":"Unauthorized access!"}}`,
+			want: ErrProtocol,
+		},
+		{
+			name: "oversized response", contentType: "application/json",
+			body: strings.Repeat("x", maxResponseBytes+1),
+			want: ErrUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				response.Header().Set("Content-Type", test.contentType)
+				_, _ = response.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, time.Second)
+			if _, err := client.Methods(
+				context.Background(),
+			); !errors.Is(err, test.want) {
+				t.Fatalf("Methods error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMethodsContextCancellationIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("before the request", func(t *testing.T) {
+		t.Parallel()
+		var hits atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(
+			http.ResponseWriter,
+			*http.Request,
+		) {
+			hits.Add(1)
+		}))
+		t.Cleanup(server.Close)
+		client := newTestClient(t, server, time.Second)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := client.Methods(ctx); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Methods cancelled error = %v", err)
+		}
+		if hits.Load() != 0 {
+			t.Fatalf("cancelled request reached provider %d times", hits.Load())
+		}
+	})
+
+	t.Run("in flight", func(t *testing.T) {
+		t.Parallel()
+		started := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(
+			_ http.ResponseWriter,
+			request *http.Request,
+		) {
+			close(started)
+			<-request.Context().Done()
+		}))
+		t.Cleanup(server.Close)
+		client := newTestClient(t, server, time.Second)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-started
+			cancel()
+		}()
+		if _, err := client.Methods(ctx); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Methods cancellation error = %v", err)
+		}
+	})
+}
+
+func TestMethodsDoesNotLogCredentials(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"methods":[{"id":"CARD_ALL"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server, time.Second)
+	if _, err := client.Methods(context.Background()); err != nil {
+		t.Fatalf("Methods: %v", err)
+	}
+	logged := output.String()
+	for _, credential := range []string{"provider-secret", client.authorization} {
+		if strings.Contains(logged, credential) {
+			t.Fatalf("Methods logged credentials: %q", logged)
+		}
+	}
+}
+
 func TestCancelRejectsNonJSONAndEmptySuccessBody(t *testing.T) {
 	t.Parallel()
 
@@ -858,6 +1184,11 @@ func TestTransportErrorsAreClassified(t *testing.T) {
 	); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Status transport error = %v", err)
 	}
+	if _, err := client.Methods(
+		context.Background(),
+	); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Methods transport error = %v", err)
+	}
 	if err := client.Cancel(
 		context.Background(), "ABCD-EFGH-IJKL",
 	); !errors.Is(err, ErrAmbiguous) {
@@ -896,6 +1227,11 @@ func TestReadErrorsAreClassified(t *testing.T) {
 		context.Background(), "ABCD-EFGH-IJKL",
 	); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Status read error = %v", err)
+	}
+	if _, err := client.Methods(
+		context.Background(),
+	); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Methods read error = %v", err)
 	}
 	if err := client.Cancel(
 		context.Background(), "ABCD-EFGH-IJKL",
@@ -1405,6 +1741,11 @@ func TestClientNilSafety(t *testing.T) {
 		context.Background(), "ABCD-EFGH-IJKL",
 	); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("nil Status error = %v", err)
+	}
+	if _, err := client.Methods(
+		context.Background(),
+	); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("nil Methods error = %v", err)
 	}
 	if err := client.Cancel(
 		context.Background(), "ABCD-EFGH-IJKL",

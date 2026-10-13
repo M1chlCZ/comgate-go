@@ -62,6 +62,31 @@ type statusResponse struct {
 	Test      booleanString `json:"test"`
 }
 
+type methodsResponse struct {
+	Methods []methodResponse `json:"methods"`
+	Error   *methodsError    `json:"error"`
+}
+
+type methodsError struct {
+	Code    responseCode `json:"code"`
+	Message string       `json:"message"`
+}
+
+type methodResponse struct {
+	ID              string `json:"id"`
+	Group           string `json:"group"`
+	GroupLabel      string `json:"groupLabel"`
+	Name            string `json:"name"`
+	ShortName       string `json:"name_short"`
+	Description     string `json:"description"`
+	Logo            string `json:"logo"`
+	Logo120Centered string `json:"logo_120c"`
+	Logo240         string `json:"logo_240"`
+	Logo240Centered string `json:"logo_240c"`
+	Logo150Square   string `json:"logo_150s"`
+	Logo100Square   string `json:"logo_100s"`
+}
+
 type resultResponse struct {
 	Code    responseCode `json:"code"`
 	Message string       `json:"message"`
@@ -202,6 +227,18 @@ func classifyRefundFailure(statusCode int) error {
 		return ErrRejected
 	}
 	return ErrAmbiguous
+}
+
+func classifyMethodsFailure(statusCode int) error {
+	if statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode >= http.StatusInternalServerError {
+		return ErrUnavailable
+	}
+	if statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError {
+		return ErrRejected
+	}
+	return ErrUnavailable
 }
 
 func classifyMutation(response *http.Response) error {

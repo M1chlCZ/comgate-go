@@ -4,8 +4,8 @@ A zero-dependency Go client for the Czech Comgate payment gateway REST API
 v2.0. The module uses only the Go standard library. The client creates
 hosted-gateway payments, reads payment status, cancels pending payments,
 requests partial or full refunds, confirms or releases pre-authorized card
-payments, charges stored recurring payments and parses background status
-notifications.
+payments, charges stored recurring payments, lists the enabled payment
+methods and parses background status notifications.
 
 ## Install
 
@@ -89,6 +89,7 @@ customer to the redirect URL.
 | --- | --- | --- |
 | `Create` | `POST /v2.0/payment.json` | Creates a hosted payment session |
 | `Status` | `GET /v2.0/payment/transId/{transId}.json` | Reads the payment state |
+| `Methods` | `GET /v2.0/method.json` | Lists the enabled payment methods |
 | `Cancel` | `DELETE /v2.0/payment/transId/{transId}.json` | Cancels a pending payment |
 | `Refund` | `POST /v2.0/refund.json` | Requests a full or partial refund |
 | `Capture` | `PUT /v2.0/preauth/transId/{transId}.json` | Confirms a pre-authorized card payment |
@@ -118,8 +119,39 @@ Rules for the calls:
   accepts 1 to 100000000 and `Recurring` accepts 1000 to 100000000.
 - `CaptureInput.Amount` zero captures the full pre-authorized amount; a value
   from 1 to 100000000 captures a partial amount.
+- `Methods` sends no filters and returns the methods that the merchant
+  account has enabled, with the provider ID, group, display names and logo
+  URLs.
 - Only the currency `CZK` is accepted. This limit matches the source
   application contract.
+
+### Payment methods
+
+`Methods` reads the payment methods that the merchant has enabled. Use it
+when the shop renders its own method selection instead of sending the
+customer to the hosted gateway.
+
+```go
+methods, err := client.Methods(ctx)
+if err != nil {
+	log.Fatal(err)
+}
+for _, method := range methods {
+	log.Printf("%s (%s): %s", method.ID, method.Group, method.Name)
+}
+```
+
+The provider applies the account defaults for the language, currency and
+country; the call sends no filters. `Method.ID` is the provider identifier,
+for example `CARD_ALL` or `CARD_CZ_COMGATE`. `Method.Group` and
+`Method.GroupLabel` carry the method group; `Method.Name` and
+`Method.ShortName` carry the display names and `Method.Description` the
+description. The logo fields `Logo`, `Logo120Centered`, `Logo240`,
+`Logo240Centered`, `Logo150Square` and `Logo100Square` are image URLs in the
+documented sizes.
+
+`CreateInput.Method` still accepts `MethodAll`, `MethodCardAll` and
+`MethodBankOnly`; the listing does not change that contract.
 
 ### Pre-authorization
 
@@ -239,7 +271,7 @@ The client returns five sentinel errors. Use `errors.Is` to test them.
 | `ErrProtocol` | The input is invalid, or the provider answer violates the protocol. | Correct the input. Do not retry. |
 | `ErrRejected` | The provider refused the request permanently. | Correct the data. Do not retry. |
 | `ErrAmbiguous` | A mutating call can have reached the provider. | Read the payment status first. Then retry. |
-| `ErrUnavailable` | A status read cannot reach the provider. | Retry later. |
+| `ErrUnavailable` | A read cannot reach the provider or the provider is temporarily unavailable. | Retry later. |
 | `ErrNotFound` | The test simulator has no such payment. | Use a valid transaction ID. |
 
 The client sends no automatic retry. For `ErrAmbiguous`, read the status with
@@ -249,8 +281,9 @@ your own backoff. The client classifies answers in this way:
 - A create or recurring answer with HTTP 400 to 499 is `ErrRejected`, except 408 and 429.
 - A cancel, cancel-preauth, refund or capture answer with HTTP 400 to 499 is `ErrRejected`, except 429.
 - An HTTP 408 answer is `ErrAmbiguous` for create and recurring, and `ErrRejected` for the other mutating calls.
-- HTTP 429 and 500 to 599 answers are `ErrAmbiguous` for every method.
-- A transport error or a timeout is `ErrAmbiguous`.
+- A `Methods` answer with HTTP 400 to 499 is `ErrRejected`, except 408 and 429. HTTP 408, 429 and 500 to 599, a transport error and a timeout are `ErrUnavailable`, like a status read. An `error` envelope in a 200 answer is `ErrRejected` for the codes 1400, 1401 and 1402 and `ErrUnavailable` for another code.
+- HTTP 429 and 500 to 599 answers are `ErrAmbiguous` for every mutating method.
+- A transport error or a timeout is `ErrAmbiguous` for a mutating call.
 
 ## Test simulator
 
@@ -290,7 +323,8 @@ log.Print(paid.Status)
 The simulator derives the external reference from the merchant reference with
 SHA-256. The same input always returns the same session. A replay of the same
 reference returns the stored payment. `Complete` marks the payment as paid and
-`Cancel` marks it as canceled.
+`Cancel` marks it as canceled. `Methods` reports a deterministic method list
+with card payments and bank transfers and returns a fresh slice on every call.
 
 The simulator accepts only create and refund input with `Test: true`. This
 rule prevents accidental use in production.
